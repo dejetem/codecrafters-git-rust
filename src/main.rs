@@ -2,13 +2,14 @@
 use std::env;
 #[allow(unused_imports)]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use std::io::prelude::*;
 use sha1::{Sha1, Digest};
+use hex;
 
 fn main() {
     eprintln!("Logs from your program will appear here!");
