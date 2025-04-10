@@ -3,6 +3,7 @@ use std::env;
 #[allow(unused_imports)]
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -129,7 +130,6 @@ fn main() {
             let tree_sha = write_tree(".").unwrap();
             println!("{}", tree_sha);
         }
-
         "commit-tree" => {
             if args.len() < 6 {
                 eprintln!("Usage: commit-tree <tree-sha> -p <parent-commit-sha> -m <message>");
@@ -151,7 +151,6 @@ fn main() {
                 Err(e) => eprintln!("Error creating commit: {}", e),
             }
         }
-        
         _ => {
             println!("unknown command: {}", args[1]);
         }
@@ -358,4 +357,3 @@ fn commit_tree(tree_sha: &str, parent_sha: &str, message: &str) -> Result<String
     
     Ok(hash_hex)
 }
-
