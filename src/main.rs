@@ -129,6 +129,28 @@ fn main() {
             let tree_sha = write_tree(".").unwrap();
             println!("{}", tree_sha);
         }
+
+        "commit-tree" => {
+            if args.len() < 6 {
+                eprintln!("Usage: commit-tree <tree-sha> -p <parent-commit-sha> -m <message>");
+                return;
+            }
+            
+            let tree_sha = &args[2];
+            
+            // Find the parent commit SHA
+            let parent_index = args.iter().position(|arg| arg == "-p").unwrap();
+            let parent_sha = &args[parent_index + 1];
+            
+            // Find the commit message
+            let message_index = args.iter().position(|arg| arg == "-m").unwrap();
+            let message = &args[message_index + 1];
+            
+            match commit_tree(tree_sha, parent_sha, message) {
+                Ok(commit_sha) => println!("{}", commit_sha),
+                Err(e) => eprintln!("Error creating commit: {}", e),
+            }
+        }
         
         _ => {
             println!("unknown command: {}", args[1]);
@@ -279,4 +301,61 @@ fn write_tree(dir_path: &str) -> Result<String, std::io::Error> {
     Ok(hash_hex)
 }
 
+// Function to create a commit object
+fn commit_tree(tree_sha: &str, parent_sha: &str, message: &str) -> Result<String, std::io::Error> {
+    // Get current timestamp
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    
+    // Hardcoded author and committer information
+    let author = "Example Author <author@example.com>";
+    let committer = "Example Committer <committer@example.com>";
+    
+    // Format the commit content
+    let commit_content = format!(
+        "tree {}\nparent {}\nauthor {} {}\ncommitter {} {}\n\n{}",
+        tree_sha,
+        parent_sha,
+        author,
+        timestamp,
+        committer,
+        timestamp,
+        message
+    );
+    
+    // Create commit header
+    let header = format!("commit {}\0", commit_content.len());
+    
+    // Combine header and content
+    let mut commit_object = Vec::new();
+    commit_object.extend_from_slice(header.as_bytes());
+    commit_object.extend_from_slice(commit_content.as_bytes());
+    
+    // Compute SHA-1 hash
+    let mut hasher = Sha1::new();
+    hasher.update(&commit_object);
+    let hash = hasher.finalize();
+    let hash_hex = format!("{:x}", hash);
+    
+    // Write commit object to .git/objects
+    let dir_path = format!(".git/objects/{}", &hash_hex[..2]);
+    let file_path = format!("{}/{}", dir_path, &hash_hex[2..]);
+    
+    // Create directory if it doesn't exist
+    if !Path::new(&dir_path).exists() {
+        fs::create_dir_all(&dir_path)?;
+    }
+    
+    // Compress the commit with zlib
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&commit_object)?;
+    let compressed = encoder.finish()?;
+    
+    // Write compressed commit to file
+    fs::write(file_path, compressed)?;
+    
+    Ok(hash_hex)
+}
 
