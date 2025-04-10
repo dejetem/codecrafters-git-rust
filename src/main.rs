@@ -92,7 +92,51 @@ fn main() {
         
         // Print the hash
         println!("{}", hash_hex);
-    } else {
+    } else if args[1] == "ls-tree" {
+        if args.len() < 4 || args[2] != "--name-only" {
+            eprintln!("Usage: ls-tree --name-only <tree_sha>");
+            return;
+        }
+
+        let sha = &args[3];
+        let path = format!(".git/objects/{}/{}", &sha[..2], &sha[2..]);
+
+        let content = fs::read(path).expect("Failed to read object file");
+        let mut decoder = ZlibDecoder::new(&content[..]);
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+
+        let mut i = 0;
+        while i < decoded.len() && decoded[i] != 0 {
+            i += 1;
+        }
+        i += 1; // Skip past null byte after "tree <size>\0"
+
+        while i < decoded.len() {
+            // Read mode
+            let mode_start = i;
+            while decoded[i] != b' ' {
+                i += 1;
+            }
+            let _mode = std::str::from_utf8(&decoded[mode_start..i]).unwrap();
+            i += 1;
+
+            // Read filename
+            let name_start = i;
+            while decoded[i] != 0 {
+                i += 1;
+            }
+            let name = std::str::from_utf8(&decoded[name_start..i]).unwrap();
+            i += 1;
+
+            // Skip the 20-byte SHA
+            i += 20;
+
+            println!("{}", name);
+        }
+    }
+
+     else {
         println!("unknown command: {}", args[1])
     }
 }
