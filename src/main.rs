@@ -312,9 +312,9 @@ fn commit_tree(tree_sha: &str, parent_sha: &str, message: &str) -> Result<String
     let author = "Example Author <author@example.com>";
     let committer = "Example Committer <committer@example.com>";
     
-    // Format the commit content
+    // Format the commit content with a newline after the message
     let commit_content = format!(
-        "tree {}\nparent {}\nauthor {} {}\ncommitter {} {}\n\n{}",
+        "tree {}\nparent {}\nauthor {} {}\ncommitter {} {}\n\n{}\n",
         tree_sha,
         parent_sha,
         author,
