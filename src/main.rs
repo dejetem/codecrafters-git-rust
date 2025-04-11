@@ -464,9 +464,7 @@ fn clone_repository(url: &str, target_dir: &str) -> Result<()> {
     } else {
         // First, look for the HEAD line which contains the SHA
         for line in refs_str.lines() {
-            if line.contains("HEAD") && line.len() >= 44 {  // 4 chars for length prefix + 40 for SHA
-                // Skip the length prefix (first 4 chars)
-                let line = &line[4..];
+            if line.contains("HEAD") && line.len() >= 40 {
                 // Extract the SHA from the line (first 40 characters)
                 head_commit = Some(line[..40].to_string());
                 break;
@@ -476,9 +474,7 @@ fn clone_repository(url: &str, target_dir: &str) -> Result<()> {
         // If we didn't find HEAD, look for master or main branch
         if head_commit.is_none() {
             for line in refs_str.lines() {
-                if (line.contains("refs/heads/master") || line.contains("refs/heads/main")) && line.len() >= 44 {
-                    // Skip the length prefix (first 4 chars)
-                    let line = &line[4..];
+                if (line.contains("refs/heads/master") || line.contains("refs/heads/main")) && line.len() >= 40 {
                     // Extract the SHA from the line (first 40 characters)
                     head_commit = Some(line[..40].to_string());
                     break;
