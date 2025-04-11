@@ -593,30 +593,37 @@ fn process_packfile(packfile: &[u8]) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "Unsupported packfile version"));
     }
     let num_objects = read_be_u32(&mut cursor)?;
+    let mut objects_processed = 0;
 
     for _ in 0..num_objects {
+       objects_processed += 1;
         let (obj_type, obj_size, header_bytes) = read_object_header(&mut cursor)?;
         let compressed_start = cursor.position() as usize;
         let mut decoder = ZlibDecoder::new(&mut cursor);
         let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed)?;
+        decoder.read_to_end(&mut decompressed).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, 
+                format!("Failed to decompress object {}: {}", objects_processed, e))
+        })?;
         let compressed_end = cursor.position() as usize;
 
         match obj_type {
-            1 | 2 | 3 | 4 => { // Commit, Tree, Blob, Tag
+            1 | 2 | 3 | 4 => {
                 let hash = Sha1::digest(&decompressed);
                 write_object_file(&hex::encode(hash), &decompressed)?;
             }
-            6 | 7 => { // OFS_DELTA, REF_DELTA (not implemented)
-                return Err(io::Error::new(io::ErrorKind::Unsupported, "Delta objects not supported"));
-            }
+            6 | 7 => {
+
+               // Skip delta objects for now
+               eprintln!("Warning: Skipping delta object");
+             }
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid object type")),
         }
 
         cursor.set_position(compressed_end as u64);
     }
 
-    // Read and verify packfile trailer (20-byte SHA-1)
+    // Read and verify packfile trailer
     let mut trailer = [0u8; 20];
     cursor.read_exact(&mut trailer)?;
 
