@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::io::{Read, Write, Cursor, BufReader};
+use std::io::{Read, Write, Cursor, BufReader, Seek, SeekFrom};
 
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -418,12 +418,17 @@ fn parse_refs(data: &[u8]) -> Result<Vec<String>> {
 fn clone_repository(url: &str, target_dir: &str) -> Result<()> {
     println!("Requesting refs from: {}/info/refs?service=git-upload-pack", url);
     
-    // Create target directory and .git directory
+    // Normalize and create target directory
+    let target_dir = Path::new(target_dir);
+    if let Some(parent) = target_dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::create_dir_all(target_dir)?;
-    let git_dir = format!("{}/.git", target_dir);
+    
+    let git_dir = target_dir.join(".git");
     fs::create_dir_all(&git_dir)?;
-    fs::create_dir_all(format!("{}/objects", git_dir))?;
-    fs::create_dir_all(format!("{}/refs", git_dir))?;
+    fs::create_dir_all(git_dir.join("objects"))?;
+    fs::create_dir_all(git_dir.join("refs"))?;
     
     // Convert GitHub URL to Smart HTTP URL
     let smart_url = if url.contains("github.com") {
@@ -547,10 +552,10 @@ fn clone_repository(url: &str, target_dir: &str) -> Result<()> {
         
         eprintln!("Writing commit object: {}", hash_hex);
         
-        let dir_path = format!("{}/.git/objects/{}", target_dir, &hash_hex[..2]);
-        let file_path = format!("{}/{}", dir_path, &hash_hex[2..]);
+        let dir_path = git_dir.join("objects").join(&hash_hex[..2]);
+        let file_path = dir_path.join(&hash_hex[2..]);
         
-        if !Path::new(&dir_path).exists() {
+        if !dir_path.exists() {
             fs::create_dir_all(&dir_path)?;
         }
         
@@ -575,10 +580,10 @@ fn clone_repository(url: &str, target_dir: &str) -> Result<()> {
         
         eprintln!("Writing empty tree object: {}", tree_hash_hex);
         
-        let dir_path = format!("{}/.git/objects/{}", target_dir, &tree_hash_hex[..2]);
-        let file_path = format!("{}/{}", dir_path, &tree_hash_hex[2..]);
+        let dir_path = git_dir.join("objects").join(&tree_hash_hex[..2]);
+        let file_path = dir_path.join(&tree_hash_hex[2..]);
         
-        if !Path::new(&dir_path).exists() {
+        if !dir_path.exists() {
             fs::create_dir_all(&dir_path)?;
         }
         
@@ -589,7 +594,12 @@ fn clone_repository(url: &str, target_dir: &str) -> Result<()> {
         fs::write(file_path, compressed)?;
         
         // Update the HEAD reference
-        fs::write(format!("{}/.git/refs/heads/main", target_dir), format!("{}\n", hash_hex))?;
+        let head_ref = git_dir.join("refs").join("heads").join("main");
+        fs::create_dir_all(head_ref.parent().unwrap())?;
+        fs::write(head_ref, format!("{}\n", hash_hex))?;
+        
+        // Create HEAD file pointing to main branch
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n")?;
         
         return Ok(());
     }
@@ -614,10 +624,15 @@ fn clone_repository(url: &str, target_dir: &str) -> Result<()> {
     
     // Process the packfile
     let mut cursor = Cursor::new(&pack_data[pack_start..]);
-    process_packfile(&mut cursor, target_dir)?;
+    process_packfile(&mut cursor, target_dir.to_str().unwrap())?;
 
     // Update the HEAD reference
-    fs::write(format!("{}/.git/refs/heads/main", target_dir), format!("{}\n", head_commit))?;
+    let head_ref = git_dir.join("refs").join("heads").join("main");
+    fs::create_dir_all(head_ref.parent().unwrap())?;
+    fs::write(head_ref, format!("{}\n", head_commit))?;
+
+    // Create HEAD file pointing to main branch
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n")?;
 
     Ok(())
 }
@@ -627,6 +642,59 @@ fn hash_content(content: &[u8]) -> Result<String> {
     hasher.update(content);
     let hash = hasher.finalize();
     Ok(format!("{:x}", hash))
+}
+
+fn process_ref_delta(cursor: &mut Cursor<&[u8]>, size: u64) -> Result<()> {
+    // Read base SHA
+    let mut base_sha = [0u8; 20];
+    cursor.read_exact(&mut base_sha)?;
+    let base_sha_hex = base_sha.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+    
+    // Read the compressed delta data
+    let start_pos = cursor.position() as usize;
+    let data = cursor.get_ref();
+    let remaining_data = &data[start_pos..];
+    
+    let mut decoder = ZlibDecoder::new(remaining_data);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+    
+    // Get the number of bytes read from the compressed data
+    let bytes_read = decoder.total_in() as u64;
+    cursor.set_position(start_pos as u64 + bytes_read);
+    
+    println!("Skipping ref delta object with base SHA {}", base_sha_hex);
+    Ok(())
+}
+
+fn process_offset_delta(cursor: &mut Cursor<&[u8]>, size: u64) -> Result<()> {
+    // Read offset
+    let mut offset_byte = [0u8; 1];
+    cursor.read_exact(&mut offset_byte)?;
+    let mut offset = (offset_byte[0] & 0x7f) as u64;
+    let mut shift = 7;
+    
+    while offset_byte[0] & 0x80 != 0 {
+        cursor.read_exact(&mut offset_byte)?;
+        offset |= ((offset_byte[0] & 0x7f) as u64) << shift;
+        shift += 7;
+    }
+    
+    // Read the compressed delta data
+    let start_pos = cursor.position() as usize;
+    let data = cursor.get_ref();
+    let remaining_data = &data[start_pos..];
+    
+    let mut decoder = ZlibDecoder::new(remaining_data);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+    
+    // Get the number of bytes read from the compressed data
+    let bytes_read = decoder.total_in() as u64;
+    cursor.set_position(start_pos as u64 + bytes_read);
+    
+    println!("Skipping offset delta object with offset {}", offset);
+    Ok(())
 }
 
 fn process_packfile(cursor: &mut Cursor<&[u8]>, target_dir: &str) -> Result<()> {
@@ -652,8 +720,15 @@ fn process_packfile(cursor: &mut Cursor<&[u8]>, target_dir: &str) -> Result<()> 
     println!("Processing packfile with {} objects", num_objects);
     
     // Process each object
-    for i in 0..num_objects {
-        println!("Processing object {}/{}", i + 1, num_objects);
+    let mut objects_processed = 0;
+    while objects_processed < num_objects {
+        println!("Processing object {}/{}", objects_processed + 1, num_objects);
+        
+        // Check if we've reached the end of the packfile
+        if cursor.position() >= cursor.get_ref().len() as u64 - 20 {
+            println!("Reached end of packfile");
+            break;
+        }
         
         // Read object type and size
         let mut byte = [0u8; 1];
@@ -674,43 +749,48 @@ fn process_packfile(cursor: &mut Cursor<&[u8]>, target_dir: &str) -> Result<()> 
         
         println!("Object type: {}, size: {}, cursor position: {}", obj_type, size, cursor.position());
         
-        // Get the current position and remaining data
-        let start_pos = cursor.position() as usize;
-        let data = cursor.get_ref();
-        let remaining_data = &data[start_pos..];
-        
-        // Create a decoder for the remaining data
-        let mut decoder = ZlibDecoder::new(remaining_data);
-        let mut decompressed = Vec::new();
-        
-        // Read exactly size bytes
-        let mut buffer = vec![0u8; size as usize];
-        decoder.read_exact(&mut buffer)?;
-        decompressed.extend_from_slice(&buffer);
-        
-        // Get the number of bytes read from the compressed data
-        let bytes_read = decoder.total_in() as u64;
-        cursor.set_position(start_pos as u64 + bytes_read);
-        
-        // Process object based on type
         match obj_type {
-            1 => process_commit_data(&decompressed, target_dir)?,
-            2 => process_tree_data(&decompressed, target_dir)?,
-            3 => process_blob_data(&decompressed, target_dir)?,
-            4 => process_tag_data(&decompressed, target_dir)?,
+            1..=4 => {
+                // Regular object types (commit, tree, blob, tag)
+                let start_pos = cursor.position() as usize;
+                let data = cursor.get_ref();
+                let remaining_data = &data[start_pos..];
+                
+                let mut decoder = ZlibDecoder::new(remaining_data);
+                let mut decompressed = Vec::new();
+                decoder.read_to_end(&mut decompressed)?;
+                
+                // Get the number of bytes read from the compressed data
+                let bytes_read = decoder.total_in() as u64;
+                cursor.set_position(start_pos as u64 + bytes_read);
+                
+                // Process object based on type
+                match obj_type {
+                    1 => process_commit_data(&decompressed[..size as usize], target_dir)?,
+                    2 => process_tree_data(&decompressed[..size as usize], target_dir)?,
+                    3 => process_blob_data(&decompressed[..size as usize], target_dir)?,
+                    4 => process_tag_data(&decompressed[..size as usize], target_dir)?,
+                    _ => unreachable!(),
+                }
+            }
             6 => {
-                // Offset delta - skip for now
-                println!("Skipping offset delta object");
+                process_offset_delta(cursor, size)?;
             }
             7 => {
-                // Ref delta - skip for now
-                println!("Skipping ref delta object");
+                process_ref_delta(cursor, size)?;
             }
             _ => return Err(anyhow::anyhow!("Unknown object type: {}", obj_type)),
         }
         
-        println!("Finished processing object {}, cursor position: {}", i + 1, cursor.position());
+        objects_processed += 1;
+        println!("Finished processing object {}, cursor position: {}", objects_processed, cursor.position());
     }
+    
+    // Read the final SHA-1 checksum
+    let data = cursor.get_ref();
+    let checksum = &data[data.len() - 20..];
+    let checksum_hex = checksum.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+    println!("Packfile checksum: {}", checksum_hex);
     
     Ok(())
 }
@@ -722,14 +802,18 @@ fn process_commit_data(data: &[u8], target_dir: &str) -> Result<()> {
     content.extend_from_slice(data);
     
     let hash = hash_content(&content)?;
-    let path = format!("{}/.git/objects/{}/{}", target_dir, &hash[..2], &hash[2..]);
-    std::fs::create_dir_all(format!("{}/.git/objects/{}", target_dir, &hash[..2]))?;
+    
+    let target_dir = Path::new(target_dir);
+    let dir_path = target_dir.join(".git").join("objects").join(&hash[..2]);
+    let file_path = dir_path.join(&hash[2..]);
+    
+    std::fs::create_dir_all(&dir_path)?;
     
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&content)?;
     let compressed = encoder.finish()?;
     
-    std::fs::write(path, compressed)?;
+    std::fs::write(file_path, compressed)?;
     println!("Writing commit object: {}", hash);
     Ok(())
 }
@@ -741,14 +825,18 @@ fn process_tree_data(data: &[u8], target_dir: &str) -> Result<()> {
     content.extend_from_slice(data);
     
     let hash = hash_content(&content)?;
-    let path = format!("{}/.git/objects/{}/{}", target_dir, &hash[..2], &hash[2..]);
-    std::fs::create_dir_all(format!("{}/.git/objects/{}", target_dir, &hash[..2]))?;
+    
+    let target_dir = Path::new(target_dir);
+    let dir_path = target_dir.join(".git").join("objects").join(&hash[..2]);
+    let file_path = dir_path.join(&hash[2..]);
+    
+    std::fs::create_dir_all(&dir_path)?;
     
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&content)?;
     let compressed = encoder.finish()?;
     
-    std::fs::write(path, compressed)?;
+    std::fs::write(file_path, compressed)?;
     println!("Writing tree object: {}", hash);
     Ok(())
 }
@@ -760,14 +848,18 @@ fn process_blob_data(data: &[u8], target_dir: &str) -> Result<()> {
     content.extend_from_slice(data);
     
     let hash = hash_content(&content)?;
-    let path = format!("{}/.git/objects/{}/{}", target_dir, &hash[..2], &hash[2..]);
-    std::fs::create_dir_all(format!("{}/.git/objects/{}", target_dir, &hash[..2]))?;
+    
+    let target_dir = Path::new(target_dir);
+    let dir_path = target_dir.join(".git").join("objects").join(&hash[..2]);
+    let file_path = dir_path.join(&hash[2..]);
+    
+    std::fs::create_dir_all(&dir_path)?;
     
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&content)?;
     let compressed = encoder.finish()?;
     
-    std::fs::write(path, compressed)?;
+    std::fs::write(file_path, compressed)?;
     println!("Writing blob object: {}", hash);
     Ok(())
 }
@@ -779,14 +871,18 @@ fn process_tag_data(data: &[u8], target_dir: &str) -> Result<()> {
     content.extend_from_slice(data);
     
     let hash = hash_content(&content)?;
-    let path = format!("{}/.git/objects/{}/{}", target_dir, &hash[..2], &hash[2..]);
-    std::fs::create_dir_all(format!("{}/.git/objects/{}", target_dir, &hash[..2]))?;
+    
+    let target_dir = Path::new(target_dir);
+    let dir_path = target_dir.join(".git").join("objects").join(&hash[..2]);
+    let file_path = dir_path.join(&hash[2..]);
+    
+    std::fs::create_dir_all(&dir_path)?;
     
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&content)?;
     let compressed = encoder.finish()?;
     
-    std::fs::write(path, compressed)?;
+    std::fs::write(file_path, compressed)?;
     println!("Writing tag object: {}", hash);
     Ok(())
 }
