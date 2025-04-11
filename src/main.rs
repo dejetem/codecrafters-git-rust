@@ -394,23 +394,22 @@ fn clone_repository(repo_url: &str, target_dir: &str) -> io::Result<()> {
     let (refs, head_symref) = parse_info_refs(&body);
 
     // Fetch packfile
-     let upload_pack_url = format!("{}/git-upload-pack", repo_url);
-     let request_body = build_upload_pack_request(&refs);
-     let client = Client::new();
-     let response = client.post(&upload_pack_url)
-         .header("Content-Type", "application/x-git-upload-pack-request")
-         .body(request_body)
-         .send()
-         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-     let packfile = response.bytes().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
- 
-     // Process packfile with sideband handling
-     let actual_packfile = parse_sideband_packets(&packfile)?;
-     process_packfile(&actual_packfile)?;
+    let upload_pack_url = format!("{}/git-upload-pack", repo_url);
+    let request_body = build_upload_pack_request(&refs);
+    let client = Client::new();
+    let response = client.post(&upload_pack_url)
+        .header("Content-Type", "application/x-git-upload-pack-request")
+        .body(request_body)
+        .send()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let packfile = response.bytes().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
+    // Process packfile with sideband handling
+    let actual_packfile = parse_sideband_packets(&packfile)?;
+   
+    
     // Process packfile
-    process_packfile(&packfile)?;
-
+    process_packfile(&actual_packfile)?;
     // Update refs and HEAD
     update_refs(&refs, head_symref)?;
 
