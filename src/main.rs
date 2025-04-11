@@ -565,8 +565,13 @@ fn parse_sideband_packets(data: &[u8]) -> io::Result<Vec<u8>> {
 
 fn build_upload_pack_request(refs: &[(String, String)]) -> Vec<u8> {
     let mut body = Vec::new();
+    let mut first_want = true;
     for (oid, _) in refs {
-        let line = format!("want {}\n", oid);
+        let mut line = format!("want {}\n", oid);
+        if first_want {
+            line = format!("want {} side-band-64k agent=my-git-client\n", oid);
+            first_want = false;
+        }
         let pkt_line = format!("{:04x}{}", line.len() + 4, line);
         body.extend(pkt_line.as_bytes());
     }
