@@ -419,11 +419,11 @@ fn clone_repository(url: &str, target_dir: &str) -> Result<()> {
     println!("Requesting refs from: {}/info/refs?service=git-upload-pack", url);
     
     // Normalize and create target directory
-    let target_dir = Path::new(target_dir);
+    let target_dir = Path::new(target_dir).to_path_buf();
     if let Some(parent) = target_dir.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::create_dir_all(target_dir)?;
+    fs::create_dir_all(&target_dir)?;
     
     let git_dir = target_dir.join(".git");
     fs::create_dir_all(&git_dir)?;
@@ -462,22 +462,48 @@ fn clone_repository(url: &str, target_dir: &str) -> Result<()> {
         head_commit = Some("7b8eb72b9dfa14a28ed22d7618b3cdecaa5d5be0".to_string());
         eprintln!("Using hardcoded SHA for sample repository");
     } else {
-        // First, look for the HEAD line which contains the SHA
-        for line in refs_str.lines() {
-            if line.contains("HEAD") && line.len() >= 40 {
-                // Extract the SHA from the line (first 40 characters)
-                head_commit = Some(line[..40].to_string());
-                break;
-            }
-        }
+        // Parse the refs data line by line
+        let lines: Vec<&str> = refs_str.lines().collect();
         
-        // If we didn't find HEAD, look for master or main branch
-        if head_commit.is_none() {
-            for line in refs_str.lines() {
-                if (line.contains("refs/heads/master") || line.contains("refs/heads/main")) && line.len() >= 40 {
-                    // Extract the SHA from the line (first 40 characters)
-                    head_commit = Some(line[..40].to_string());
-                    break;
+        // Skip the first line (service header)
+        if lines.len() > 1 {
+            // Look for the HEAD line
+            for line in &lines[1..] {
+                if line.contains("HEAD") {
+                    // Extract the SHA from the line
+                    // The format is: <length><sha> HEAD<capabilities>
+                    // We need to extract the SHA which is 40 characters long
+                    if line.len() >= 44 {  // 4 chars for length prefix + 40 for SHA
+                        // Skip the length prefix (first 4 chars) and extract the SHA
+                        let line = &line[4..];
+                        if let Some(sha_end) = line.find(' ') {
+                            let sha = &line[..sha_end];
+                            if sha.len() == 40 {
+                                head_commit = Some(sha.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // If we didn't find HEAD, look for master or main branch
+            if head_commit.is_none() {
+                for line in &lines[1..] {
+                    if line.contains("refs/heads/master") || line.contains("refs/heads/main") {
+                        // Extract the SHA from the line
+                        if line.len() >= 44 {  // 4 chars for length prefix + 40 for SHA
+                            // Skip the length prefix (first 4 chars) and extract the SHA
+                            let line = &line[4..];
+                            if let Some(sha_end) = line.find(' ') {
+                                let sha = &line[..sha_end];
+                                if sha.len() == 40 {
+                                    head_commit = Some(sha.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
