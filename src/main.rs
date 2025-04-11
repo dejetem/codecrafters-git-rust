@@ -394,15 +394,19 @@ fn clone_repository(repo_url: &str, target_dir: &str) -> io::Result<()> {
     let (refs, head_symref) = parse_info_refs(&body);
 
     // Fetch packfile
-    let upload_pack_url = format!("{}/git-upload-pack", repo_url);
-    let request_body = build_upload_pack_request(&refs);
-    let client = Client::new();
-    let response = client.post(&upload_pack_url)
-        .header("Content-Type", "application/x-git-upload-pack-request")
-        .body(request_body)
-        .send()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let packfile = response.bytes().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+     let upload_pack_url = format!("{}/git-upload-pack", repo_url);
+     let request_body = build_upload_pack_request(&refs);
+     let client = Client::new();
+     let response = client.post(&upload_pack_url)
+         .header("Content-Type", "application/x-git-upload-pack-request")
+         .body(request_body)
+         .send()
+         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+     let packfile = response.bytes().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+ 
+     // Process packfile with sideband handling
+     let actual_packfile = parse_sideband_packets(&packfile)?;
+     process_packfile(&actual_packfile)?;
 
     // Process packfile
     process_packfile(&packfile)?;
@@ -458,58 +462,6 @@ fn read_packet_lines(data: &[u8]) -> Vec<Vec<u8>> {
     lines
 }
 
-fn build_upload_pack_request(refs: &[(String, String)]) -> Vec<u8> {
-    let mut body = Vec::new();
-    for (oid, _) in refs {
-        let line = format!("want {}\n", oid);
-        let len = line.len() + 4;
-        body.extend(format!("{:04x}", len).as_bytes());
-        body.extend(line.as_bytes());
-    }
-    body.extend(b"0000"); // Flush
-    body.extend(b"0009done\n");
-    body
-}
-
-fn process_packfile(packfile: &[u8]) -> io::Result<()> {
-    let mut cursor = Cursor::new(packfile);
-    let mut header = [0u8; 4];
-    cursor.read_exact(&mut header)?;
-    if &header != b"PACK" {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid packfile header"));
-    }
-    let version = read_be_u32(&mut cursor)?;
-    if version != 2 && version != 3 {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "Unsupported packfile version"));
-    }
-    let num_objects = read_be_u32(&mut cursor)?;
-
-    for _ in 0..num_objects {
-        let (obj_type, obj_size, header_bytes) = read_object_header(&mut cursor)?;
-        let compressed_start = cursor.position() as usize;
-        let mut decoder = ZlibDecoder::new(&mut cursor);
-        let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed)?;
-        let compressed_end = cursor.position() as usize;
-        let compressed_bytes = compressed_end - compressed_start;
-
-        match obj_type {
-            1 | 2 | 3 | 4 => { // Commit, Tree, Blob, Tag
-                let hash = Sha1::digest(&decompressed);
-                write_object_file(&hex::encode(hash), &decompressed)?;
-            }
-            6 | 7 => { // Delta (not implemented)
-                return Err(io::Error::new(io::ErrorKind::Unsupported, "Delta objects not supported"));
-            }
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid object type")),
-        }
-
-        cursor.set_position(compressed_end as u64);
-    }
-
-    Ok(())
-}
-
 fn read_be_u32(r: &mut Cursor<&[u8]>) -> io::Result<u32> {
     let mut buf = [0u8; 4];
     r.read_exact(&mut buf)?;
@@ -562,6 +514,107 @@ fn update_refs(refs: &[(String, String)], head_symref: Option<String>) -> io::Re
             fs::write(path, oid)?;
         }
     }
+
+    Ok(())
+}
+
+
+
+
+
+// helo
+fn parse_sideband_packets(data: &[u8]) -> io::Result<Vec<u8>> {
+    let mut cursor = Cursor::new(data);
+    let mut actual_packfile = Vec::new();
+
+    while cursor.position() < data.len() as u64 {
+        let mut len_buf = [0u8; 4];
+        cursor.read_exact(&mut len_buf)?;
+        let len = match u32::from_str_radix(std::str::from_utf8(&len_buf).unwrap(), 16) {
+            Ok(l) => l as usize,
+            Err(_) => break, // Possibly encountered flush packet (0000)
+        };
+
+        if len == 0 {
+            break; // Flush packet
+        }
+
+        if len < 4 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid packet length"));
+        }
+
+        let data_len = len - 4; // Subtract header length
+        let mut packet_data = vec![0u8; data_len];
+        cursor.read_exact(&mut packet_data)?;
+
+        if packet_data.is_empty() {
+            continue;
+        }
+
+        let band = packet_data[0];
+        match band {
+            1 => actual_packfile.extend_from_slice(&packet_data[1..]), // Skip band byte
+            2 => eprint!("{}", String::from_utf8_lossy(&packet_data[1..])), // Progress messages
+            3 => return Err(io::Error::new(io::ErrorKind::Other, 
+                format!("Error: {}", String::from_utf8_lossy(&packet_data[1..])))),
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid sideband")),
+        }
+    }
+
+    Ok(actual_packfile)
+}
+
+fn build_upload_pack_request(refs: &[(String, String)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (oid, _) in refs {
+        let line = format!("want {}\n", oid);
+        let pkt_line = format!("{:04x}{}", line.len() + 4, line);
+        body.extend(pkt_line.as_bytes());
+    }
+    body.extend(b"0000"); // Flush after wants
+    body.extend(b"0009done\n"); // "done" command in a pkt-line
+    body.extend(b"0000"); // Final flush
+    body
+}
+
+fn process_packfile(packfile: &[u8]) -> io::Result<()> {
+    let mut cursor = Cursor::new(packfile);
+    let mut header = [0u8; 4];
+    cursor.read_exact(&mut header)?;
+    if &header != b"PACK" {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid packfile header"));
+    }
+    let version = read_be_u32(&mut cursor)?;
+    if version != 2 && version != 3 {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "Unsupported packfile version"));
+    }
+    let num_objects = read_be_u32(&mut cursor)?;
+
+    for _ in 0..num_objects {
+        let (obj_type, obj_size, header_bytes) = read_object_header(&mut cursor)?;
+        let compressed_start = cursor.position() as usize;
+        let mut decoder = ZlibDecoder::new(&mut cursor);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)?;
+        let compressed_end = cursor.position() as usize;
+
+        match obj_type {
+            1 | 2 | 3 | 4 => { // Commit, Tree, Blob, Tag
+                let hash = Sha1::digest(&decompressed);
+                write_object_file(&hex::encode(hash), &decompressed)?;
+            }
+            6 | 7 => { // OFS_DELTA, REF_DELTA (not implemented)
+                return Err(io::Error::new(io::ErrorKind::Unsupported, "Delta objects not supported"));
+            }
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid object type")),
+        }
+
+        cursor.set_position(compressed_end as u64);
+    }
+
+    // Read and verify packfile trailer (20-byte SHA-1)
+    let mut trailer = [0u8; 20];
+    cursor.read_exact(&mut trailer)?;
 
     Ok(())
 }
