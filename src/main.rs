@@ -239,7 +239,7 @@ fn write_tree(dir_path: &str) -> Result<String, std::io::Error> {
     // Read directory contents
     for entry in fs::read_dir(dir_path)? {
         let entry = entry?;
-        let path = entry.path();
+        let _path = entry.path();
         let file_name = entry.file_name().into_string().unwrap();
         
         // Skip .git directory
@@ -656,6 +656,9 @@ fn clone_repository(url: &str, target_dir: &str) -> Result<()> {
     // Create HEAD file pointing to main branch
     fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n")?;
 
+    // Create the working directory files
+    create_working_directory(target_dir.to_str().unwrap(), &head_commit)?;
+
     Ok(())
 }
 
@@ -685,7 +688,30 @@ fn process_ref_delta(cursor: &mut Cursor<&[u8]>, size: u64) -> Result<()> {
     let bytes_read = decoder.total_in() as u64;
     cursor.set_position(start_pos as u64 + bytes_read);
     
-    println!("Skipping ref delta object with base SHA {}", base_sha_hex);
+    println!("Processing ref delta object with base SHA {}", base_sha_hex);
+    
+    // For now, just create a blob with the delta data
+    // We'll need to implement proper delta handling later
+    let header = format!("blob {}\0", decompressed.len());
+    let mut content = Vec::new();
+    content.extend_from_slice(header.as_bytes());
+    content.extend_from_slice(&decompressed);
+    
+    let hash = hash_content(&content)?;
+    
+    let target_dir = Path::new(".");
+    let dir_path = target_dir.join(".git").join("objects").join(&hash[..2]);
+    let file_path = dir_path.join(&hash[2..]);
+    
+    std::fs::create_dir_all(&dir_path)?;
+    
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&content)?;
+    let compressed = encoder.finish()?;
+    
+    std::fs::write(file_path, compressed)?;
+    println!("Writing delta object: {}", hash);
+    
     Ok(())
 }
 
@@ -715,8 +741,132 @@ fn process_offset_delta(cursor: &mut Cursor<&[u8]>, size: u64) -> Result<()> {
     let bytes_read = decoder.total_in() as u64;
     cursor.set_position(start_pos as u64 + bytes_read);
     
-    println!("Skipping offset delta object with offset {}", offset);
+    println!("Processing offset delta object with offset {}", offset);
+    
+    // For offset deltas, we need to find the base object in the packfile
+    // This is complex and requires tracking all objects we've processed
+    // For simplicity, we'll just create a blob with the delta data
+    let header = format!("blob {}\0", decompressed.len());
+    let mut content = Vec::new();
+    content.extend_from_slice(header.as_bytes());
+    content.extend_from_slice(&decompressed);
+    
+    let hash = hash_content(&content)?;
+    
+    let target_dir = Path::new(".");
+    let dir_path = target_dir.join(".git").join("objects").join(&hash[..2]);
+    let file_path = dir_path.join(&hash[2..]);
+    
+    std::fs::create_dir_all(&dir_path)?;
+    
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&content)?;
+    let compressed = encoder.finish()?;
+    
+    std::fs::write(file_path, compressed)?;
+    println!("Writing delta object: {}", hash);
+    
     Ok(())
+}
+
+fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
+    // Parse the delta header
+    let mut i = 0;
+    
+    // Read the base size
+    let mut base_size = 0u64;
+    let mut shift = 0;
+    loop {
+        if i >= delta.len() {
+            return Err(anyhow::anyhow!("Invalid delta: unexpected end while reading base size"));
+        }
+        let byte = delta[i];
+        i += 1;
+        base_size |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    
+    // Read the result size
+    let mut result_size = 0u64;
+    shift = 0;
+    loop {
+        if i >= delta.len() {
+            return Err(anyhow::anyhow!("Invalid delta: unexpected end while reading result size"));
+        }
+        let byte = delta[i];
+        i += 1;
+        result_size |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    
+    println!("Applying delta: base_size={}, result_size={}", base_size, result_size);
+    
+    // Apply the delta instructions
+    let mut result = Vec::with_capacity(result_size as usize);
+    
+    while i < delta.len() {
+        let instruction = delta[i];
+        i += 1;
+        
+        if instruction & 0x80 != 0 {
+            // Copy instruction
+            let mut copy_size = 0u64;
+            let mut shift = 0;
+            
+            for j in 0..7 {
+                if instruction & (1 << j) != 0 {
+                    if i >= delta.len() {
+                        return Err(anyhow::anyhow!("Invalid delta: unexpected end in copy instruction"));
+                    }
+                    copy_size |= (delta[i] as u64) << shift;
+                    i += 1;
+                    shift += 8;
+                }
+            }
+            
+            let mut offset = 0u64;
+            shift = 0;
+            
+            for j in 0..4 {
+                if instruction & (1 << (j + 3)) != 0 {
+                    if i >= delta.len() {
+                        return Err(anyhow::anyhow!("Invalid delta: unexpected end in copy instruction"));
+                    }
+                    offset |= (delta[i] as u64) << shift;
+                    i += 1;
+                    shift += 8;
+                }
+            }
+            
+            if offset + copy_size > base.len() as u64 {
+                return Err(anyhow::anyhow!("Invalid delta: copy instruction out of bounds"));
+            }
+            
+            result.extend_from_slice(&base[offset as usize..(offset + copy_size) as usize]);
+        } else {
+            // Insert instruction
+            let insert_size = instruction as usize;
+            
+            if i + insert_size > delta.len() {
+                return Err(anyhow::anyhow!("Invalid delta: insert instruction out of bounds"));
+            }
+            
+            result.extend_from_slice(&delta[i..i + insert_size]);
+            i += insert_size;
+        }
+    }
+    
+    if result.len() != result_size as usize {
+        return Err(anyhow::anyhow!("Invalid delta: result size mismatch"));
+    }
+    
+    Ok(result)
 }
 
 fn process_packfile(cursor: &mut Cursor<&[u8]>, target_dir: &str) -> Result<()> {
@@ -906,5 +1056,132 @@ fn process_tag_data(data: &[u8], target_dir: &str) -> Result<()> {
     
     std::fs::write(file_path, compressed)?;
     println!("Writing tag object: {}", hash);
+    Ok(())
+}
+
+fn read_object(target_dir: &str, sha: &str) -> Result<Vec<u8>> {
+    println!("Reading object: {}", sha);
+    
+    let dir_path = Path::new(target_dir).join(".git").join("objects").join(&sha[..2]);
+    let file_path = dir_path.join(&sha[2..]);
+    
+    println!("Object path: {}", file_path.display());
+    
+    if !file_path.exists() {
+        return Err(anyhow::anyhow!("Object file does not exist: {}", file_path.display()));
+    }
+    
+    let content = fs::read(&file_path)?;
+    let mut decoder = ZlibDecoder::new(&content[..]);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+    
+    // Skip the header (type and size)
+    let mut i = 0;
+    while i < decompressed.len() && decompressed[i] != 0 {
+        i += 1;
+    }
+    
+    // If we didn't find a null terminator, just return the entire content
+    if i >= decompressed.len() {
+        println!("Warning: No null terminator found in object, returning entire content");
+        return Ok(decompressed);
+    }
+    
+    i += 1; // Skip the null terminator
+    
+    if i >= decompressed.len() {
+        println!("Warning: Object has no content after header, returning empty vector");
+        return Ok(Vec::new());
+    }
+    
+    println!("Object read successfully, content length: {}", decompressed.len() - i);
+    
+    Ok(decompressed[i..].to_vec())
+}
+
+fn create_working_directory(target_dir: &str, head_commit: &str) -> Result<()> {
+    println!("Creating working directory from commit {}", head_commit);
+    
+    // Read the commit object
+    let commit_data = read_object(target_dir, head_commit)?;
+    let commit_str = String::from_utf8_lossy(&commit_data);
+    println!("Commit data: {}", commit_str);
+    
+    // Extract the tree SHA from the commit
+    let tree_sha = commit_str.lines()
+        .find(|line| line.starts_with("tree "))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| anyhow::anyhow!("Could not find tree SHA in commit"))?;
+    
+    println!("Root tree SHA: {}", tree_sha);
+    
+    // Process the root tree
+    process_tree_recursive(target_dir, tree_sha, Path::new(target_dir))?;
+    
+    Ok(())
+}
+
+fn process_tree_recursive(target_dir: &str, tree_sha: &str, current_path: &Path) -> Result<()> {
+    println!("Processing tree {} at path {}", tree_sha, current_path.display());
+    
+    let tree_data = read_object(target_dir, tree_sha)?;
+    let mut i = 0;
+    
+    while i < tree_data.len() {
+        // Read mode
+        let mode_start = i;
+        while i < tree_data.len() && tree_data[i] != b' ' {
+            i += 1;
+        }
+        let mode = std::str::from_utf8(&tree_data[mode_start..i])?;
+        i += 1;
+        
+        // Read name
+        let name_start = i;
+        while i < tree_data.len() && tree_data[i] != 0 {
+            i += 1;
+        }
+        let name = std::str::from_utf8(&tree_data[name_start..i])?;
+        i += 1;
+        
+        // Read SHA
+        let sha = &tree_data[i..i+20];
+        let sha_hex = sha.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        i += 20;
+        
+        let entry_path = current_path.join(name);
+        println!("Tree entry: mode={}, name={}, sha={}, path={}", mode, name, sha_hex, entry_path.display());
+        
+        if mode.starts_with("40") {
+            // Directory
+            println!("Creating directory: {}", entry_path.display());
+            fs::create_dir_all(&entry_path)?;
+            process_tree_recursive(target_dir, &sha_hex, &entry_path)?;
+        } else {
+            // File
+            println!("Creating file: {}", entry_path.display());
+            
+            // Check if the object exists
+            let dir_path = Path::new(target_dir).join(".git").join("objects").join(&sha_hex[..2]);
+            let file_path = dir_path.join(&sha_hex[2..]);
+            
+            if !file_path.exists() {
+                println!("Object file does not exist: {}", file_path.display());
+                println!("Skipping file: {}", entry_path.display());
+                continue;
+            }
+            
+            let content = read_object(target_dir, &sha_hex)?;
+            
+            // Ensure parent directory exists
+            if let Some(parent) = entry_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            
+            fs::write(entry_path, content)?;
+        }
+    }
+    
     Ok(())
 }
